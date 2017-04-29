@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"regexp"
 	"strconv"
 
 	etcd "github.com/coreos/etcd/client"
@@ -101,6 +102,11 @@ func discoverDevices(executor exec.Executor) ([]*LocalDisk, error) {
 	}
 
 	for _, d := range devices {
+		isRBD := regexp.MustCompile("rbd[0-9]+")
+		if isRBD.MatchString(d) {
+			// is rbd device by itself, ignoring to avoid deadlock-like situations
+			continue
+		}
 
 		diskProps, err := sys.GetDeviceProperties(d, executor)
 		if err != nil {
