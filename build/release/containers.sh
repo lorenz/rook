@@ -33,8 +33,13 @@ build_artifact() {
 
     local name=$(get_image_name $os $arch $repo ${RELEASE_VERSION})
 
+    local docker_no_cache=
+    if [[ ${RELEASE_CHANNEL} != "" ]]; then
+        docker_no_cache=--no-cache
+    fi
+
     echo building docker container ${name}
-    docker build -t ${registry}${name} $tmpdir
+    docker build --pull ${docker_no_cache} -t ${registry}${name} $tmpdir
 
     local file=${name/\//-}
     local file=${file/:/-}
@@ -52,15 +57,67 @@ build() {
 
     [[ ${os} == "linux" ]] || return 0
 
+    local baseimage=UNSUPPORTED
+    case ${arch} in
+        arm) baseimage=armhf/alpine ;;
+        amd64) baseimage=alpine ;;
+        arm64) baseimage=aarch64/alpine ;;
+    esac
+
+    echo "Building the rookd container"
     tmpdir=$(mktemp -d)
     trap "rm -fr $tmpdir" EXIT
     cat <<EOF > $tmpdir/Dockerfile
-FROM alpine:3.5
+FROM ${baseimage}:3.5
 RUN apk add --no-cache gptfdisk util-linux coreutils e2fsprogs
 COPY root /
 ENTRYPOINT ["/usr/bin/rookd"]
 EOF
     build_artifact $os $arch $tmpdir rook/rookd rookd
+    rm -fr $tmpdir
+
+    # TODO: build the client and toolbox for arm
+    [[ ${arch} == "amd64" ]] || return 0
+ 
+    echo "Building the rook-client container"
+    mkdir $tmpdir
+    cat <<EOF > $tmpdir/Dockerfile
+FROM ubuntu
+RUN apt-get update && \
+    apt-get install -yq --no-install-recommends wget s3cmd kmod module-init-tools sudo
+COPY root /
+ENTRYPOINT ["/usr/bin/rook"]
+EOF
+    build_artifact $os $arch $tmpdir rook/rook-client rook
+    rm -fr $tmpdir
+
+    echo "Building the toolbox container"
+    mkdir $tmpdir
+    cp toolbox/entrypoint.sh $tmpdir
+    cat <<EOF > $tmpdir/Dockerfile
+FROM ubuntu:xenial
+RUN apt-key adv --keyserver hkp://p80.pool.sks-keyservers.net:80 --recv-keys 08b73419ac32b4e966c1a330e84ac2c0460f3994 \
+    && echo "deb http://download.ceph.com/debian-${CEPH_BRANCH}/ xenial main" > /etc/apt/sources.list.d/ceph-${CEPH_BRANCH}.list \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends \
+        binutils \
+        ceph-common \
+        curl \
+        fio \
+        gdb \
+        iperf3 \
+        jq \
+        kmod \
+        less \
+        man-db \
+        sudo \
+        vim \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+COPY root /
+COPY entrypoint.sh /toolbox/
+ENTRYPOINT [ "/toolbox/entrypoint.sh" ]
+EOF
+    build_artifact $os $arch $tmpdir rook/toolbox rook
     rm -fr $tmpdir
 }
 
@@ -90,6 +147,12 @@ publish() {
     [[ ${os} == "linux" ]] || return 0
 
     publish_artifact $os $arch rook/rookd
+
+    # TODO: publish the client and toolbox for arm
+    [[ ${arch} == "amd64" ]] || return 0
+ 
+    publish_artifact $os $arch rook/rook-client
+    publish_artifact $os $arch rook/toolbox
 }
 
 promote_artifact() {
@@ -122,18 +185,19 @@ cleanup_artifact() {
     local os=$1
     local arch=$2
     local repo=$3
+    local img
 
-    local src=${registry}$(get_image_name $os $arch $repo ${RELEASE_VERSION})
-    echo removing docker image ${src}
-    docker rmi ${src} || true
-
-    local dst1=${registry}$(get_image_name $os $arch $repo ${RELEASE_CHANNEL}-latest)
-    echo removing docker image ${dst1}
-    docker rmi ${dst1} || true
-
-    local dst2=${registry}$(get_image_name $os $arch $repo ${RELEASE_CHANNEL}-${RELEASE_VERSION})
-    echo removing docker image ${dst2}
-    docker rmi ${dst2} || true
+    for t in \
+        ${RELEASE_VERSION} \
+        ${RELEASE_CHANNEL}-latest \
+        ${RELEASE_CHANNEL}-${RELEASE_VERSION} \
+        ; do
+        img=${registry}$(get_image_name $os $arch $repo ${t})
+        if [[ -n "$(docker images -q ${img} 2> /dev/null)" ]]; then
+            echo removing docker image ${img}
+            docker rmi ${img} || true
+        fi
+    done
 }
 
 cleanup() {
@@ -141,8 +205,9 @@ cleanup() {
     local arch=$2
 
     [[ ${os} == "linux" ]] || return 0
-
     cleanup_artifact $os $arch rook/rookd
+    cleanup_artifact $os $arch rook/rook-client
+    cleanup_artifact $os $arch rook/toolbox
 }
 
 action=$1
